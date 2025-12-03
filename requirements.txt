@@ -1,0 +1,6 @@
+# requirements.txt
+google-genai
+langgraph
+# These are often dependencies but good practice to include
+pydantic
+sqlite3 # Standard Python library, usually not needed in requirements but harmless
