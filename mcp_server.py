@@ -1,140 +1,312 @@
-# mcp_server.py
-# Implements the Model Context Protocol (MCP) tools for agent use.
+"""
+MCP HTTP/SSE server that exposes customer-support tools.
 
-import sqlite3
+Run with:
+    python mcp_server.py
+"""
+
+from __future__ import annotations
+
 import json
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, Callable
 
-# IMPORTANT: Database file name must match the one used in database_setup.py
-DATABASE_NAME = 'support.db'
+from flask import Flask, request, Response, jsonify
+from flask_cors import CORS
 
-def _execute_query(query: str, params: tuple = ()) -> List[Dict[str, Any]]:
-    """Helper to execute a read query and return results as a list of dicts."""
-    conn = sqlite3.connect(DATABASE_NAME)
-    conn.row_factory = sqlite3.Row  # Allows accessing columns by name
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    rows = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return rows
+from database_utils import CustomerServiceDB
 
-def _execute_update(query: str, params: tuple = ()) -> int:
-    """Helper to execute an update query and return the row count."""
-    conn = sqlite3.connect(DATABASE_NAME)
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    conn.commit()
-    count = cursor.rowcount
-    conn.close()
-    return count
+# -----------------------------------------------------------------------------
+# Server bootstrap
+# -----------------------------------------------------------------------------
 
-# --- MCP Tools Implementation ---
+app = Flask(__name__)
+CORS(app)
+db = CustomerServiceDB()
 
-def get_customer(customer_id: int) -> str:
-    """
-    Retrieves a single customer's information by ID.
-    """
-    query = "SELECT id, name, email, phone, status FROM customers WHERE id = ?"
-    result = _execute_query(query, (customer_id,))
-    if not result:
-        return f"ERROR: Customer with ID {customer_id} not found."
-    return json.dumps(result[0])
 
-def list_customers(status: Optional[str] = None, limit: int = 100) -> str:
-    """
-    Lists customers based on status ('active', 'disabled').
-    """
-    query = "SELECT id, name, email, status FROM customers WHERE 1=1"
-    params = []
-    
-    if status:
-        query += " AND status = ?"
-        params.append(status)
-    
-    query += f" LIMIT {limit}"
-    
-    results = _execute_query(query, tuple(params))
-    if not results:
-        return "No customers found matching the criteria."
-    return json.dumps(results)
+# -----------------------------------------------------------------------------
+# Utility helpers
+# -----------------------------------------------------------------------------
 
-def update_customer(customer_id: int, data: Dict[str, Any]) -> str:
-    """
-    Updates a customer record with new data (email, phone, status).
-    """
-    updates = []
-    params = []
-    for key, value in data.items():
-        if key in ('name', 'email', 'phone', 'status'):
-            updates.append(f"{key} = ?")
-            params.append(value)
-    
-    if not updates:
-        return "ERROR: No valid fields provided for update."
+def create_sse_message(payload: Dict[str, Any]) -> str:
+    """Format a payload as an SSE message."""
+    return f"data: {json.dumps(payload)}\n\n"
 
-    # NOTE: The database_setup.py uses an UPDATE trigger for updated_at, 
-    # so we don't manually set it here.
-    params.append(customer_id)
-    
-    query = f"UPDATE customers SET {', '.join(updates)} WHERE id = ?"
-    count = _execute_update(query, tuple(params))
-    
-    if count == 0:
-        return f"ERROR: Customer with ID {customer_id} not found for update."
-    return f"Customer ID {customer_id} successfully updated with new data."
 
-def create_ticket(customer_id: int, issue: str, priority: str) -> str:
-    """
-    Creates a new support ticket. Priority must be 'low', 'medium', or 'high'.
-    """
-    query = """
-        INSERT INTO tickets (customer_id, issue, status, priority)
-        VALUES (?, ?, 'open', ?)
-    """
+def format_db_result(raw: str) -> Dict[str, Any]:
+    """Normalize outputs from database_utils into structured dicts."""
     try:
-        count = _execute_update(query, (customer_id, issue, priority.lower()))
-        if count > 0:
-            # We assume the ID is the last inserted row ID for the ticket
-            conn = sqlite3.connect(DATABASE_NAME)
-            ticket_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            conn.close()
-            return f"SUCCESS: New '{priority}' priority ticket (ID: {ticket_id}) created for customer ID {customer_id}."
-        return "ERROR: Could not create ticket."
-    except sqlite3.IntegrityError:
-        return f"ERROR: Foreign Key constraint failed. Customer ID {customer_id} may not exist."
+        parsed = json.loads(raw)
+        return {"success": True, "data": parsed}
+    except json.JSONDecodeError:
+        upper = raw.upper()
+        if upper.startswith("ERROR"):
+            return {"success": False, "error": raw}
+        return {"success": True, "message": raw}
 
-def get_customer_history(customer_id: int, status: Optional[str] = None) -> str:
-    """
-    Retrieves all tickets associated with a customer ID, optionally filtered by status.
-    """
-    query = "SELECT id, issue, status, priority, created_at FROM tickets WHERE customer_id = ?"
-    params = [customer_id]
-    
-    if status:
-        query += " AND status = ?"
-        params.append(status)
-        
-    results = _execute_query(query, tuple(params))
-    
-    if not results:
-        return f"No ticket history found for customer ID {customer_id}."
-    return json.dumps(results)
 
-# A dictionary to easily map function names to the callable tools
-MCP_TOOLS = {
-    'get_customer': get_customer,
-    'list_customers': list_customers,
-    'update_customer': update_customer,
-    'create_ticket': create_ticket,
-    'get_customer_history': get_customer_history,
+# -----------------------------------------------------------------------------
+# Tool definitions (mirrors ADK tutorial schema)
+# -----------------------------------------------------------------------------
+
+MCP_TOOLS = [
+    {
+        "name": "get_customer",
+        "description": "Retrieve a customer's profile by ID.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {
+                    "type": "integer",
+                    "description": "Unique customer ID."
+                }
+            },
+            "required": ["customer_id"]
+        }
+    },
+    {
+        "name": "list_customers",
+        "description": "List customers, optionally filtered by status ('active' or 'disabled').",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["active", "disabled"],
+                    "description": "Optional status filter."
+                }
+            }
+        }
+    },
+    {
+        "name": "update_customer",
+        "description": "Update customer contact information or status.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "integer"},
+                "name": {"type": "string"},
+                "email": {"type": "string"},
+                "phone": {"type": "string"},
+                "status": {"type": "string", "enum": ["active", "disabled"]}
+            },
+            "required": ["customer_id"]
+        }
+    },
+    {
+        "name": "create_ticket",
+        "description": "Create a new support ticket for a customer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "integer"},
+                "issue": {"type": "string"},
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Ticket priority"
+                }
+            },
+            "required": ["customer_id", "issue", "priority"]
+        }
+    },
+    {
+        "name": "get_customer_history",
+        "description": "Retrieve ticket history for a customer.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_id": {"type": "integer"},
+                "status": {"type": "string", "description": "Optional ticket status filter"}
+            },
+            "required": ["customer_id"]
+        }
+    },
+    {
+        "name": "get_high_priority_tickets_by_ids",
+        "description": "Get high-priority tickets for a list of customer IDs.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "customer_ids": {
+                    "type": "array",
+                    "description": "List of customer IDs.",
+                    "items": {"type": "integer"}
+                }
+            },
+            "required": ["customer_ids"]
+        }
+    },
+    {
+        "name": "list_active_customers_with_open_tickets",
+        "description": "List active customers who currently have open tickets.",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+]
+
+
+def tool_get_customer(customer_id: int, **_: Any) -> Dict[str, Any]:
+    return format_db_result(db.get_customer(customer_id))
+
+
+def tool_list_customers(status: str | None = None, **_: Any) -> Dict[str, Any]:
+    return format_db_result(db.list_customers(status))
+
+
+def tool_update_customer(customer_id: int, **data: Any) -> Dict[str, Any]:
+    return format_db_result(db.update_customer(customer_id, data))
+
+
+def tool_create_ticket(customer_id: int, issue: str, priority: str, **_: Any) -> Dict[str, Any]:
+    return format_db_result(db.create_ticket(customer_id, issue, priority))
+
+
+def tool_get_customer_history(customer_id: int, status: str | None = None, **_: Any) -> Dict[str, Any]:
+    return format_db_result(db.get_customer_history(customer_id, status))
+
+
+def tool_get_high_priority(customer_ids: list[int], **_: Any) -> Dict[str, Any]:
+    return format_db_result(db.get_high_priority_tickets_by_ids(customer_ids))
+
+
+def tool_list_active_with_open(**_: Any) -> Dict[str, Any]:
+    return format_db_result(db.list_active_customers_with_open_tickets())
+
+
+TOOL_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
+    "get_customer": tool_get_customer,
+    "list_customers": tool_list_customers,
+    "update_customer": tool_update_customer,
+    "create_ticket": tool_create_ticket,
+    "get_customer_history": tool_get_customer_history,
+    "get_high_priority_tickets_by_ids": tool_get_high_priority,
+    "list_active_customers_with_open_tickets": tool_list_active_with_open,
 }
 
-if __name__ == '__main__':
-    # Simple test cases for the MCP tools (Requires support.db to exist)
-    print("--- Testing MCP Tools ---")
-    print("Customer 1 Info (ID 1):", get_customer(1))
-    print("Active Customers:", list_customers(status='active', limit=2))
-    print("Customer 2 History:", get_customer_history(2))
-    print("Update Customer 1 Email:", update_customer(1, {'email': 'john.new@test.com'}))
-    print("New Ticket for Customer 3:", create_ticket(3, "Account login issue", "high"))
-    print("Customer 3 History (Updated):", get_customer_history(3))
+
+# -----------------------------------------------------------------------------
+# MCP protocol handlers
+# -----------------------------------------------------------------------------
+
+def handle_initialize(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": message.get("id"),
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "customer-management-mcp-server", "version": "1.0.0"},
+        },
+    }
+
+
+def handle_tools_list(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": message.get("id"),
+        "result": {"tools": MCP_TOOLS},
+    }
+
+
+def handle_tools_call(message: Dict[str, Any]) -> Dict[str, Any]:
+    params = message.get("params", {})
+    name = params.get("name")
+    arguments = params.get("arguments", {}) or {}
+
+    if name not in TOOL_FUNCTIONS:
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {"code": -32601, "message": f"Unknown tool: {name}"},
+        }
+
+    try:
+        result = TOOL_FUNCTIONS[name](**arguments)
+        payload = json.dumps(result, indent=2, sort_keys=True)
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {"content": [{"type": "text", "text": payload}]},
+        }
+    except TypeError as exc:
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {"code": -32602, "message": f"Invalid params for {name}: {exc}"},
+        }
+    except Exception as exc:  # pragma: no cover - defensive logging
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {"code": -32603, "message": f"Tool execution error: {exc}"},
+        }
+
+
+def handle_prompts_list(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"prompts": []}}
+
+
+def handle_resources_list(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": message.get("id"), "result": {"resources": []}}
+
+
+def handle_resources_read(message: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": message.get("id"),
+        "error": {"code": -32601, "message": "No resources available"},
+    }
+
+
+def process_mcp_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    method = message.get("method")
+    if method == "initialize":
+        return handle_initialize(message)
+    if method == "tools/list":
+        return handle_tools_list(message)
+    if method == "tools/call":
+        return handle_tools_call(message)
+    if method == "prompts/list":
+        return handle_prompts_list(message)
+    if method == "resources/list":
+        return handle_resources_list(message)
+    if method == "resources/read":
+        return handle_resources_read(message)
+    return {
+        "jsonrpc": "2.0",
+        "id": message.get("id"),
+        "error": {"code": -32601, "message": f"Method not found: {method}"},
+    }
+
+
+# -----------------------------------------------------------------------------
+# Flask routes
+# -----------------------------------------------------------------------------
+
+@app.route("/mcp", methods=["POST"])
+def mcp_endpoint() -> Response:
+    message = request.get_json(force=True, silent=False)
+
+    def generate():
+        try:
+            response = process_mcp_message(message)
+            yield create_sse_message(response)
+        except Exception as exc:  # pragma: no cover
+            error_payload = {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {"code": -32700, "message": f"Server error: {exc}"},
+            }
+            yield create_sse_message(error_payload)
+
+    return Response(generate(), mimetype="text/event-stream")
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy", "server": "customer-management-mcp-server", "version": "1.0.0"})
+
+
+if __name__ == "__main__":
+    print("Starting MCP server on http://0.0.0.0:8000 (SSE)")
+    app.run(host="0.0.0.0", port=8000, debug=False)
